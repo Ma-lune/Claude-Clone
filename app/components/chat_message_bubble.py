@@ -14,10 +14,10 @@ def user_message_bubble(
                 ),
                 class_name="bg-[#353740] p-3 rounded-lg shadow",
             ),
-            rx.el.div(
-                "NR",
-                class_name="flex items-center justify-center w-8 h-8 bg-neutral-700 text-neutral-300 rounded-full text-sm font-medium ml-4 shrink-0",
-            ),
+            # rx.el.div(
+            #     "",
+            #     class_name="flex items-center justify-center w-8 h-8 bg-neutral-700 text-neutral-300 rounded-full text-sm font-medium ml-4 shrink-0",
+            # ),
             class_name="flex items-start flex-row-reverse",
         ),
         class_name="w-full flex justify-end mb-6",
@@ -31,7 +31,7 @@ def ai_message_bubble(message: Message) -> rx.Component:
             rx.cond(
                 is_initial,
                 rx.el.div(
-                    "NR",
+                    "",
                     class_name="flex items-center justify-center w-8 h-8 bg-neutral-600 text-neutral-200 rounded-full text-sm font-medium mr-3 shrink-0",
                 ),
                 rx.icon(
