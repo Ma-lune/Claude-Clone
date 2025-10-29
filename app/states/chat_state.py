@@ -6,6 +6,10 @@ from typing import (
 )
 import os
 import anthropic
+import json
+from urllib import request as urllib_request
+from urllib.error import HTTPError, URLError
+import re
 
 
 class Message(TypedDict):
@@ -98,27 +102,14 @@ class ChatState(rx.State):
 
     @rx.event(background=True)
     async def stream_anthropic_response(self):
-        # Prefer a direct Anthropic key.
-        # Fall back to OpenRouter if present. Many OpenRouter keys are
-        # prefixed with `sk-or-` and are stored in `.env` as
-        # `ANTHROPIC_API_KEY` or `OPENROUTER_API_KEY`.
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
         openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-        if not api_key and openrouter_key:
-            # Use the OpenRouter key in place of ANTHROPIC_API_KEY so the
-            # existing Anthropic client code can continue to work.
+        using_openrouter = bool(openrouter_key)
+        if using_openrouter:
             api_key = openrouter_key
-            # Ensure the environment variable is also set for any downstream
-            # code that reads ANTHROPIC_API_KEY.
-            os.environ["ANTHROPIC_API_KEY"] = openrouter_key
-            # If the consumer needs to call the OpenRouter endpoint, set a
-            # sensible default base to point to OpenRouter's API. This does
-            # not change behavior of the Anthropic SDK directly here, but
-            # provides an environment hint for libraries which respect it.
-            os.environ.setdefault(
-                "ANTHROPIC_API_BASE", "https://api.openrouter.ai/v1"
-            )
-        if not api_key:
+        elif anthropic_key:
+            api_key = anthropic_key
+        else:
             async with self:
                 self.messages[-1][
                     "content"
@@ -128,7 +119,8 @@ class ChatState(rx.State):
                     "API key not configured."
                 )
             return
-        client = anthropic.Anthropic(api_key=api_key)
+        if not using_openrouter:
+            client = anthropic.Anthropic(api_key=api_key)
         api_call_messages = [
             {"role": m["role"], "content": m["content"]}
             for m in self.messages[:-1]
@@ -159,6 +151,77 @@ class ChatState(rx.State):
         model_id = API_MODEL_MAPPING.get(
             self.selected_model, "claude-3-haiku-20240307"
         )
+        if using_openrouter:
+            model_core = re.sub(r"-\d{8}$", "", model_id)
+            if not model_core.startswith("anthropic/"):
+                model_id = f"anthropic/{model_core}"
+            else:
+                model_id = model_core
+            payload = {
+                "model": model_id,
+                "messages": [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in api_call_messages
+                ],
+            }
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            http_referer = os.environ.get("OPENROUTER_HTTP_REFERER")
+            if http_referer:
+                headers["HTTP-Referer"] = http_referer
+            app_title = os.environ.get("OPENROUTER_APP_TITLE", "Claude Lite")
+            if app_title:
+                headers["X-Title"] = app_title
+            url = os.environ.get(
+                "OPENROUTER_CHAT_URL",
+                "https://openrouter.ai/api/v1/chat/completions",
+            )
+            try:
+                req = urllib_request.Request(
+                    url=url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib_request.urlopen(req, timeout=60) as resp:
+                    resp_text = resp.read().decode("utf-8")
+                    try:
+                        resp_json = json.loads(resp_text)
+                    except json.JSONDecodeError:
+                        raise RuntimeError(
+                            f"Invalid JSON from OpenRouter: {resp_text[:200]}"
+                        )
+                    if "choices" in resp_json and resp_json["choices"]:
+                        content = resp_json["choices"][0]["message"].get(
+                            "content", ""
+                        )
+                    else:
+                        content = resp_json.get("error", {}).get(
+                            "message", "Unknown error"
+                        )
+                    async with self:
+                        self.messages[-1]["content"] = content
+            except HTTPError as e:
+                body = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
+                async with self:
+                    self.messages[-1][
+                        "content"
+                    ] = f"OpenRouter HTTP error {e.code}: {body}"
+                    self.error_message = f"OpenRouter HTTP error {e.code}: {body}"
+            except URLError as e:
+                async with self:
+                    self.messages[-1]["content"] = f"OpenRouter network error: {e}"
+                    self.error_message = f"OpenRouter network error: {e}"
+            except Exception as e:
+                async with self:
+                    self.messages[-1]["content"] = f"OpenRouter error: {e}"
+                    self.error_message = f"OpenRouter error: {e}"
+            finally:
+                async with self:
+                    self.is_streaming = False
+            return
         try:
             with client.messages.stream(
                 max_tokens=1024,
